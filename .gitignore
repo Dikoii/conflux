@@ -13,7 +13,8 @@ build/
 # SQLite databases
 *.db
 *.sqlite3
-
+*.db-shm
+*.db-wal
 # IDE
 .vscode/
 .idea/
