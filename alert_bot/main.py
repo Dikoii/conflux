@@ -13,6 +13,7 @@ from alert_bot.telegram_bot import (
     build_application,
     init_telegram,
     send_telegram_alert,
+    send_telegram_trade_close,
 )
 from alert_bot.exchange_ws.binance import start_binance
 from alert_bot.exchange_ws.bitget import start_bitget
@@ -67,6 +68,7 @@ async def main() -> None:
             db_conn=db_conn,
             last_price_dict=last_price,
             send_alert_fn=send_telegram_alert,
+            send_trade_close_fn=send_telegram_trade_close,
         )
 
     # 5. Build exchange tasks

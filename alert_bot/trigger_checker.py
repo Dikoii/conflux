@@ -64,6 +64,7 @@ async def process_tick(
     db_conn,
     last_price_dict: dict,
     send_alert_fn,
+    send_trade_close_fn,
 ) -> None:
     """Process a single price tick: check triggers, send alerts, log price.
 
@@ -78,6 +79,7 @@ async def process_tick(
         db_conn: SQLite connection.
         last_price_dict: Shared mutable dict of (exchange, symbol) -> last price.
         send_alert_fn: Async callable(alert_row, price) to send Telegram notification.
+        send_trade_close_fn: Async callable(trade_row, price, pnl_pct) to send Telegram notification.
     """
     key = (exchange, symbol)
     prev_price = last_price_dict.get(key)
@@ -100,6 +102,37 @@ async def process_tick(
             except Exception:
                 logger.exception("Failed to send Telegram alert for #%d", alert["id"])
             db.mark_triggered(db_conn, alert["id"])
+
+    # Check trades
+    trades = db.get_active_trades(db_conn, exchange, symbol)
+    for trade in trades:
+        sl = trade["stop_loss"]
+        tp = trade["take_profit"]
+        entry = trade["entry_price"]
+        side = trade["side"]
+        
+        hit_sl = False
+        hit_tp = False
+        
+        if side == "long":
+            hit_sl = price <= sl or (prev_price is not None and prev_price > sl and price < sl)
+            hit_tp = price >= tp or (prev_price is not None and prev_price < tp and price > tp)
+            pnl_pct = (price - entry) / entry * 100
+        else: # short
+            hit_sl = price >= sl or (prev_price is not None and prev_price < sl and price > sl)
+            hit_tp = price <= tp or (prev_price is not None and prev_price > tp and price < tp)
+            pnl_pct = (entry - price) / entry * 100
+
+        if hit_sl or hit_tp:
+            logger.info(
+                "CLOSED trade #%d: %s %s price=%.8g pnl=%.2f%%",
+                trade["id"], exchange, symbol, price, pnl_pct
+            )
+            db.close_trade(db_conn, trade["id"], price, pnl_pct)
+            try:
+                await send_trade_close_fn(trade, price, pnl_pct, hit_tp)
+            except Exception:
+                logger.exception("Failed to send Telegram trade close for #%d", trade["id"])
 
     # CRITICAL: update last price UNCONDITIONALLY — gap-detection depends on this.
     last_price_dict[key] = price

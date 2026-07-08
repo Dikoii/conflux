@@ -44,6 +44,21 @@ def init_db(conn: sqlite3.Connection) -> None:
             price REAL NOT NULL,
             ts TEXT NOT NULL
         );
+        
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT NOT NULL,
+            exchange TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            stop_loss REAL NOT NULL,
+            take_profit REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_price REAL,
+            pnl_pct REAL,
+            created_at TEXT NOT NULL,
+            closed_at TEXT
+        );
         """
     )
     conn.commit()
@@ -99,9 +114,13 @@ def mark_triggered(conn: sqlite3.Connection, alert_id: int) -> None:
 
 
 def get_active_symbols(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-    """Return distinct (exchange, symbol) pairs with active alerts."""
+    """Return distinct (exchange, symbol) pairs with active alerts or open trades."""
     rows = conn.execute(
-        "SELECT DISTINCT exchange, symbol FROM alerts WHERE status='active'"
+        """
+        SELECT exchange, symbol FROM alerts WHERE status='active'
+        UNION
+        SELECT exchange, symbol FROM trades WHERE status='open'
+        """
     ).fetchall()
     return [(row["exchange"], row["symbol"]) for row in rows]
 
@@ -115,3 +134,58 @@ def log_price(
         (exchange, symbol, price, _now_iso()),
     )
     conn.commit()
+
+
+# ── Trades ───────────────────────────────────────────────────────────
+
+
+def create_trade(
+    conn: sqlite3.Connection,
+    symbol: str,
+    exchange: str,
+    side: str,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: float,
+) -> int:
+    """Insert a new trade and return its ID."""
+    cursor = conn.execute(
+        "INSERT INTO trades (symbol, exchange, side, entry_price, stop_loss, take_profit, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'open', ?)",
+        (symbol, exchange, side, entry_price, stop_loss, take_profit, _now_iso()),
+    )
+    conn.commit()
+    return cursor.lastrowid
+
+
+def list_open_trades(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Return all open trades."""
+    return conn.execute("SELECT * FROM trades WHERE status='open' ORDER BY id").fetchall()
+
+
+def get_active_trades(
+    conn: sqlite3.Connection, exchange: str, symbol: str
+) -> list[sqlite3.Row]:
+    """Get all open trades for a specific exchange+symbol pair."""
+    return conn.execute(
+        "SELECT * FROM trades WHERE exchange=? AND symbol=? AND status='open'",
+        (exchange, symbol),
+    ).fetchall()
+
+
+def close_trade(conn: sqlite3.Connection, trade_id: int, closed_price: float, pnl_pct: float) -> None:
+    """Mark a trade as closed and record final price and PnL."""
+    conn.execute(
+        "UPDATE trades SET status='closed', closed_price=?, pnl_pct=?, closed_at=? WHERE id=?",
+        (closed_price, pnl_pct, _now_iso(), trade_id),
+    )
+    conn.commit()
+
+
+def get_latest_price(conn: sqlite3.Connection, exchange: str, symbol: str) -> float | None:
+    """Get the most recent logged price for a symbol."""
+    row = conn.execute(
+        "SELECT price FROM price_log WHERE exchange=? AND symbol=? ORDER BY id DESC LIMIT 1",
+        (exchange, symbol),
+    ).fetchone()
+    return row["price"] if row else None
