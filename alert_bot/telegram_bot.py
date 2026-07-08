@@ -10,6 +10,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters,
     ContextTypes,
 )
 
@@ -22,6 +25,9 @@ logger = logging.getLogger("conflux.telegram")
 _exchange_queues: dict[str, asyncio.Queue] = {}
 _db_conn = None
 
+# ── Conversation states ───────────────────────────────────────────────
+SYMBOL, EXCHANGE, PRICE, RANGE, NOTE = range(5)
+
 
 def init_telegram(db_conn, exchange_queues: dict[str, asyncio.Queue]) -> None:
     """Set shared state for the Telegram handlers."""
@@ -30,109 +36,185 @@ def init_telegram(db_conn, exchange_queues: dict[str, asyncio.Queue]) -> None:
     _exchange_queues = exchange_queues
 
 
-# ── Command Handlers ─────────────────────────────────────────────────
+# ── /newalert — Guided Conversation ──────────────────────────────────
 
-
-async def cmd_newalert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/newalert <symbol> <exchange> <target_price> <range_pct> <note...>"""
-    if not context.args or len(context.args) < 4:
-        await update.message.reply_text(
-            "Usage: /newalert <symbol> <exchange> <target_price> <range_pct> [note...]\n"
-            "Example: /newalert BTCUSDT binance 65000 2 resistance retest"
-        )
-        return
-
-    symbol = context.args[0].upper()
-    exchange = context.args[1].lower()
-    target_price_str = context.args[2]
-    range_pct_str = context.args[3]
-    note = " ".join(context.args[4:]) if len(context.args) > 4 else None
-
-    # Validate exchange
-    if exchange not in VALID_EXCHANGES:
-        await update.message.reply_text(
-            f"❌ Invalid exchange: '{exchange}'\n"
-            f"Valid exchanges: {', '.join(sorted(VALID_EXCHANGES))}"
-        )
-        return
-
-    # Validate target_price
-    try:
-        target_price = float(target_price_str)
-    except ValueError:
-        await update.message.reply_text(
-            f"❌ Invalid target_price: '{target_price_str}' — must be a number"
-        )
-        return
-
-    # Validate range_pct
-    try:
-        range_pct = float(range_pct_str)
-    except ValueError:
-        await update.message.reply_text(
-            f"❌ Invalid range_pct: '{range_pct_str}' — must be a number"
-        )
-        return
-
-    # Create alert
-    alert_id = db.create_alert(_db_conn, symbol, exchange, target_price, range_pct, note)
-
-    # Echo back all parsed values so the user catches typos
-    note_display = f'note="{note}"' if note else "no note"
+async def conv_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/newalert entry point — ask for symbol."""
+    context.user_data.clear()
     await update.message.reply_text(
-        f"✅ Alert #{alert_id} created\n"
-        f"  symbol={symbol}\n"
-        f"  exchange={exchange}\n"
-        f"  target={target_price}\n"
-        f"  range={range_pct}%\n"
-        f"  {note_display}"
+        "🔔 *New Alert — Step 1/5*\n\nWhat is the trading symbol?\n_(e.g. BTCUSDT for Binance/Bitget, BTC\\-USDT for OKX)_",
+        parse_mode="MarkdownV2",
     )
+    return SYMBOL
 
-    # Push dynamic subscribe request to the exchange task
-    if exchange in _exchange_queues:
-        await _exchange_queues[exchange].put(("subscribe", symbol))
-        logger.info("Queued subscribe for %s on %s", symbol, exchange)
 
+async def conv_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive symbol, ask for exchange."""
+    context.user_data["symbol"] = update.message.text.strip().upper()
+    keyboard = [[
+        InlineKeyboardButton("Binance", callback_data="ex_binance"),
+        InlineKeyboardButton("Bitget", callback_data="ex_bitget"),
+        InlineKeyboardButton("OKX", callback_data="ex_okx"),
+    ]]
+    await update.message.reply_text(
+        f"✅ Symbol: *{context.user_data['symbol']}*\n\n📡 *Step 2/5* — Which exchange?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return EXCHANGE
+
+
+async def conv_exchange(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive exchange button tap, ask for target price."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["exchange"] = query.data.split("_")[1]  # e.g. "binance"
+    await query.message.reply_text(
+        f"✅ Exchange: *{context.user_data['exchange'].capitalize()}*\n\n💰 *Step 3/5* — What is the target price?\n_(e.g. 65000)_",
+        parse_mode="Markdown",
+    )
+    return PRICE
+
+
+async def conv_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive target price, ask for range %."""
+    text = update.message.text.strip()
+    try:
+        context.user_data["target_price"] = float(text)
+    except ValueError:
+        await update.message.reply_text("❌ That doesn't look like a number. Please enter a valid price (e.g. 65000):")
+        return PRICE
+
+    await update.message.reply_text(
+        f"✅ Target: *{context.user_data['target_price']}*\n\n📏 *Step 4/5* — What range percentage?\n_(e.g. 2 means the alert fires when price is within ±2% of your target)_",
+        parse_mode="Markdown",
+    )
+    return RANGE
+
+
+async def conv_range(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive range %, ask for note."""
+    text = update.message.text.strip()
+    try:
+        context.user_data["range_pct"] = float(text)
+    except ValueError:
+        await update.message.reply_text("❌ That doesn't look like a number. Please enter a valid percentage (e.g. 2):")
+        return RANGE
+
+    keyboard = [[InlineKeyboardButton("⏭ Skip", callback_data="note_skip")]]
+    await update.message.reply_text(
+        f"✅ Range: *{context.user_data['range_pct']}%*\n\n📝 *Step 5/5* — Any note for this alert?\n_(e.g. 'resistance retest', or tap Skip)_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return NOTE
+
+
+async def conv_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive note text and create the alert."""
+    context.user_data["note"] = update.message.text.strip()
+    return await _create_alert(update.message, context)
+
+
+async def conv_note_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Skip note and create the alert."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data["note"] = None
+    return await _create_alert(query.message, context)
+
+
+async def _create_alert(message, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Final step: save alert to DB and notify the exchange."""
+    d = context.user_data
+    alert_id = db.create_alert(
+        _db_conn,
+        d["symbol"],
+        d["exchange"],
+        d["target_price"],
+        d["range_pct"],
+        d.get("note"),
+    )
+    note_display = f'📝 {d["note"]}' if d.get("note") else "No note"
+    await message.reply_text(
+        f"✅ *Alert #{alert_id} created!*\n\n"
+        f"  📈 Symbol: `{d['symbol']}`\n"
+        f"  📡 Exchange: `{d['exchange'].capitalize()}`\n"
+        f"  💰 Target: `{d['target_price']}`\n"
+        f"  📏 Range: `±{d['range_pct']}%`\n"
+        f"  {note_display}",
+        parse_mode="Markdown",
+    )
+    # Push subscribe request
+    if d["exchange"] in _exchange_queues:
+        await _exchange_queues[d["exchange"]].put(("subscribe", d["symbol"]))
+        logger.info("Queued subscribe for %s on %s", d["symbol"], d["exchange"])
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def conv_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the conversation."""
+    context.user_data.clear()
+    await update.message.reply_text("❌ Alert creation cancelled.")
+    return ConversationHandler.END
+
+
+# ── /listalerts ───────────────────────────────────────────────────────
 
 async def cmd_listalerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/listalerts — show all alerts regardless of status."""
-    alerts = db.list_alerts(_db_conn)
+    """/listalerts — show only active alerts with 2-column delete buttons."""
+    all_alerts = db.list_alerts(_db_conn)
+    active = [a for a in all_alerts if a["status"] == "active"]
+    triggered_count = len(all_alerts) - len(active)
 
-    if not alerts:
-        await update.message.reply_text("No alerts found.")
+    if not active:
+        suffix = f"\n\n_{triggered_count} triggered alert(s) are hidden._" if triggered_count else ""
+        await update.message.reply_text(f"No active alerts found.{suffix}", parse_mode="Markdown")
         return
 
     lines = []
-    keyboard = []
-    for a in alerts:
-        note_str = f' note="{a["note"]}"' if a["note"] else ""
+    for a in active:
+        note_str = f'\n    📝 {a["note"]}' if a["note"] else ""
         lines.append(
-            f'#{a["id"]} {a["symbol"]} {a["exchange"]} '
-            f'target={a["target_price"]} range={a["range_pct"]}%'
-            f'{note_str} [{a["status"]}]'
+            f'#{a["id"]} *{a["symbol"]}* `{a["exchange"]}`  '
+            f'target=`{a["target_price"]}` range=`{a["range_pct"]}%`'
+            f'{note_str}'
         )
-        # Add a button for this alert
-        keyboard.append([InlineKeyboardButton(f"❌ Delete #{a['id']}", callback_data=f"del_{a['id']}")])
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup)
+    # Build 2-column button rows
+    buttons = [InlineKeyboardButton(f"❌ #{a['id']}", callback_data=f"del_{a['id']}") for a in active]
+    keyboard = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+
+    footer = f"\n\n_{triggered_count} triggered alert(s) hidden._" if triggered_count else ""
+    await update.message.reply_text(
+        "\n\n".join(lines) + footer,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ── Inline button callbacks ───────────────────────────────────────────
 
 async def btn_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle inline keyboard button taps."""
+    """Handle inline keyboard button taps (delete and exchange selection)."""
     query = update.callback_query
-    await query.answer()  # Acknowledge the tap
+    await query.answer()
 
     if query.data.startswith("del_"):
         try:
             alert_id = int(query.data.split("_")[1])
             deleted = db.delete_alert(_db_conn, alert_id)
             if deleted:
-                await query.message.reply_text(f"✅ Alert #{alert_id} deleted via button.")
+                await query.message.reply_text(f"✅ Alert #{alert_id} deleted.")
             else:
                 await query.message.reply_text(f"❌ No alert with ID #{alert_id}.")
         except ValueError:
             pass
 
+
+# ── /deletealert (manual fallback) ───────────────────────────────────
 
 async def cmd_deletealert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/deletealert <id> — delete an alert by its ID."""
@@ -155,7 +237,7 @@ async def cmd_deletealert(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(f"❌ No alert with ID #{alert_id}.")
 
 
-# ── Alert Notification ───────────────────────────────────────────────
+# ── Alert Notification ────────────────────────────────────────────────
 
 _bot_app: Application | None = None
 
@@ -168,18 +250,18 @@ async def send_telegram_alert(alert, price: float) -> None:
 
     note_str = f'\n📝 {alert["note"]}' if alert["note"] else ""
     message = (
-        f'🚨 Alert #{alert["id"]} TRIGGERED\n'
-        f'  {alert["symbol"]} on {alert["exchange"]}\n'
-        f'  Price: {price}\n'
-        f'  Target: {alert["target_price"]} ± {alert["range_pct"]}%'
+        f'🚨 *Alert #{alert["id"]} TRIGGERED*\n'
+        f'  📈 {alert["symbol"]} on {alert["exchange"]}\n'
+        f'  💰 Price: `{price}`\n'
+        f'  🎯 Target: `{alert["target_price"]}` ±`{alert["range_pct"]}%`'
         f'{note_str}'
     )
 
-    await _bot_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+    await _bot_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
     logger.info("Sent Telegram alert for #%d", alert["id"])
 
 
-# ── Bot Setup ────────────────────────────────────────────────────────
+# ── Bot Setup ─────────────────────────────────────────────────────────
 
 
 def build_application() -> Application:
@@ -187,7 +269,23 @@ def build_application() -> Application:
     global _bot_app
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("newalert", cmd_newalert))
+    # Guided new-alert conversation
+    newalert_conv = ConversationHandler(
+        entry_points=[CommandHandler("newalert", conv_start)],
+        states={
+            SYMBOL:   [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_symbol)],
+            EXCHANGE: [CallbackQueryHandler(conv_exchange, pattern="^ex_")],
+            PRICE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_price)],
+            RANGE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, conv_range)],
+            NOTE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, conv_note_text),
+                CallbackQueryHandler(conv_note_skip, pattern="^note_skip$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", conv_cancel)],
+    )
+
+    app.add_handler(newalert_conv)
     app.add_handler(CommandHandler("listalerts", cmd_listalerts))
     app.add_handler(CommandHandler("deletealert", cmd_deletealert))
     app.add_handler(CallbackQueryHandler(btn_callback))
