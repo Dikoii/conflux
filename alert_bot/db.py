@@ -182,6 +182,16 @@ def close_trade(conn: sqlite3.Connection, trade_id: int, closed_price: float, pn
     conn.commit()
 
 
+def update_trade_sl_tp(conn: sqlite3.Connection, trade_id: int, new_sl: float, new_tp: float) -> bool:
+    """Update stop loss and take profit for an open trade."""
+    result = conn.execute(
+        "UPDATE trades SET stop_loss=?, take_profit=? WHERE id=? AND status='open'",
+        (new_sl, new_tp, trade_id),
+    )
+    conn.commit()
+    return result.rowcount > 0
+
+
 def get_latest_price(conn: sqlite3.Connection, exchange: str, symbol: str) -> float | None:
     """Get the most recent logged price for a symbol."""
     row = conn.execute(
